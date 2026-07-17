@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "flare"
+version = "0.1.0"
+description = "From-scratch Triton kernels for modern attention variants — FlashAttention v2, MLA, KDA"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "triton>=2.0",
+]
+
+[project.optional-dependencies]
+bench = ["pandas", "matplotlib"]
