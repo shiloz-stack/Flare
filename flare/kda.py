@@ -111,14 +111,14 @@ def _kda_chunk_fwd(
 
     # ── compute output for this chunk ──
     # O = Q @ S (contribution from previous state)
-    O_intra = tl.dot(Q_blk * scale, S)  # (Chunk, D)
+    O_intra = tl.dot(Q_blk * scale, S)  # (Chunk, D) — fp32 accumulator
 
     # ── intra-chunk: causal linear attention within the chunk ──
     # For token i, attend to tokens j <= i within the chunk:
     #   O_i += sum_{j<=i} beta_j * V_j (Q_i · K_j)
     # This is a causal linear attention pattern.
     # We compute it as a (Chunk, Chunk) matrix that fits in SRAM.
-    attn = tl.dot(Q_blk * scale, tl.trans(K_blk))  # (Chunk, Chunk)
+    attn = tl.dot(Q_blk * scale, tl.trans(K_blk))  # (Chunk, Chunk) — fp32
     attn = tl.where(
         tl.arange(0, Chunk)[:, None] >= tl.arange(0, Chunk)[None, :],
         attn, 0.0,
@@ -126,10 +126,10 @@ def _kda_chunk_fwd(
     # apply beta scaling
     attn = attn * beta[None, :]  # (Chunk, Chunk)
 
-    O_chunk = tl.dot(attn.to(V_blk.dtype), V_blk)  # (Chunk, D)
+    O_chunk = tl.dot(attn.to(V_blk.dtype), V_blk)  # (Chunk, D) — cast attn to fp16 for dot
 
     # total output = contribution from state + intra-chunk
-    O_final = O_intra + O_chunk
+    O_final = (O_intra + O_chunk).to(O_b.dtype.element_ty)
 
     # ── store output ──
     tl.store(
@@ -145,8 +145,8 @@ def _kda_chunk_fwd(
     VK = tl.dot(
         tl.trans(V_blk * beta[:, None]).to(K_blk.dtype),
         K_blk,
-    )  # (D, D)
-    S_new = S + VK
+    )  # (D, D) — fp32, but S is fp16 → cast
+    S_new = S + VK.to(S.dtype)
 
     tl.store(
         S_b + offs_d[:, None] * stride_sd0 + offs_d[None, :] * stride_sd1,

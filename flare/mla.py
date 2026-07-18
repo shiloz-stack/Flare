@@ -101,14 +101,14 @@ def _mla_attn_fwd(
             UK_h + tl.arange(0, d_compress)[:, None] * stride_uk_d
                    + tl.arange(0, D_qk)[None, :] * stride_uk_k,
         )  # (d_compress, D_qk)
-        K_blk = tl.dot(c_kv, W_UK_blk)  # (Bc, D_qk)
+        K_blk = tl.dot(c_kv, W_UK_blk).to(Q_blk.dtype)  # (Bc, D_qk) — tl.dot returns fp32, cast back
 
         # V = c_kv @ W_UV_h  →  (Bc, D_v)
         W_UV_blk = tl.load(
             UV_h + tl.arange(0, d_compress)[:, None] * stride_uv_d
                    + tl.arange(0, D_v)[None, :] * stride_uv_v,
         )  # (d_compress, D_v)
-        V_blk = tl.dot(c_kv, W_UV_blk)  # (Bc, D_v)
+        V_blk = tl.dot(c_kv, W_UV_blk).to(Q_blk.dtype)  # (Bc, D_v)
 
         # ── standard attention score ──
         S = tl.dot(Q_blk, tl.trans(K_blk)) * scale  # (Br, Bc)
