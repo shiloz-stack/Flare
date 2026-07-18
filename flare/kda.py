@@ -123,12 +123,14 @@ def _kda_chunk_fwd(
         mask=mask_n[:, None],
     )
 
-    # ── 4. update state: S += sum_t beta_t * V_t ⊗ K_t ──
-    VK = tl.dot(
-        tl.trans(V_blk * beta[:, None]).to(K_blk.dtype),
-        K_blk,
-    )  # (D, D) fp32
-    S_new = S + VK.to(S.dtype)
+    # ── 4. update state: S += sum_t beta_t * K_t ⊗ V_t ──
+    # State must store K⊗V (NOT V⊗K) so that Q@S gives (Q·K)V,
+    # matching the intra-chunk attention computation.
+    KS = tl.dot(
+        tl.trans(K_blk * beta[:, None]).to(V_blk.dtype),
+        V_blk,
+    )  # (D, D) — S[d,e] = sum_t beta_t * K_t[d] * V_t[e]
+    S_new = S + KS.to(S.dtype)
 
     tl.store(
         S_b + offs_d[:, None] * stride_sd0 + offs_d[None, :] * stride_sd1,
@@ -216,7 +218,7 @@ def kda_attention_ref(q, k, v, beta=None):
 
         o[:, :, t, :] = o_t.to(q.dtype)
 
-        # state update: S += beta_t * V_t ⊗ K_t
-        S = S + b_t[:, :, None, None] * torch.einsum('bhd,bhe->bhde', v_t, k_t)
+        # state update: S += beta_t * K_t ⊗ V_t  (K⊗V, not V⊗K)
+        S = S + b_t[:, :, None, None] * torch.einsum('bhd,bhe->bhde', k_t, v_t)
 
     return o
