@@ -5,32 +5,27 @@ KDA is a linear attention variant with fine-grained per-channel gating.
 Unlike softmax attention (O(N²)), linear attention maintains a recurrent
 state of size (D, D) and processes each token in O(D²) time — O(N×D²) total.
 
-This makes it efficient for very long sequences (>1M tokens) where the N²
-cost of softmax attention becomes prohibitive.
-
 Architecture (per layer):
   1. Q, K, V projections (same as standard attention)
   2. Delta rule update:
-       S_t = S_{t-1} + β_t · V_t ⊗ K_t     (gated state update)
+       S_t = S_{t-1} + β_t · K_t ⊗ V_t     (state stores K⊗V)
        O_t = Q_t @ S_{t-1} + β_t · (Q_t · K_t) · V_t
-     where β_t is a per-head, per-channel gate.
 
-  The "delta rule" name comes from the update being equivalent to
-  online delta rule learning. This is a generalization of DeltaNet
-  (Yang et al., 2024).
+  Why K⊗V (not V⊗K):
+    S[d,e] = Σ β_j K_j[d] V_j[e]
+    O[e]   = Σ_d Q[d] S[d,e] = Σ_j β_j (Q · K_j) V_j[e]  ← (Q·K)V ✓
 
-For a chunked implementation (processing Chunk tokens at a time):
-  1. Compute intra-chunk causal linear attention (like a small attention matrix)
-  2. Add contribution from the recurrent state (Q @ S)
-  3. Update state with this chunk's K, V contributions
+For a chunked implementation:
+  1. O_inter = Q @ S_prev  (contribution from previous chunks' state)
+  2. O_intra = causal(Q @ K^T) * beta @ V  (within-chunk attention)
+  3. S_new = S_prev + K^T @ diag(beta) @ V  (update state)
 
-  CRITICAL: chunks are sequentially dependent (state from chunk i feeds chunk i+1).
-  We launch one kernel per chunk from Python, passing state between launches.
-  This is the same pattern used by flash-linear-attention and vLLM.
+  CRITICAL: chunks are sequentially dependent. We launch one kernel per chunk
+  from Python, passing state between launches.
 
 References:
   - Kimi Linear technical report (2025)
-  - Yang et al., "Gated DeltaNet: Improving Mamba2 with Delta Rule", 2024
+  - Yang et al., "Gated DeltaNet", 2024
   - https://github.com/fla-org/flash-linear-attention
 """
 
@@ -42,29 +37,24 @@ import triton.language as tl
 @triton.jit
 def _kda_chunk_fwd(
     Q, K, V, Beta, O,
-    State,           # (B, H, D, D) — read input state, write output state
-    # strides
+    State,           # (B, H, D, D) fp32 — read input state, write output state
     stride_qb, stride_qh, stride_qn, stride_qd,
     stride_kb, stride_kh, stride_kn, stride_kd,
     stride_vb, stride_vh, stride_vn, stride_vd,
     stride_bb, stride_bh, stride_bn,
     stride_ob, stride_oh, stride_on, stride_od,
     stride_sb, stride_sh, stride_sd0, stride_sd1,
-    chunk_start,     # runtime: offset of this chunk
+    chunk_start,
     N,
     scale: tl.constexpr,
     Chunk: tl.constexpr,
     D: tl.constexpr,
 ):
-    """
-    Single-chunk KDA forward. One program per (batch, head).
-    Called sequentially from Python for each chunk.
-    """
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
 
-    offs_n = chunk_start + tl.arange(0, Chunk)  # (Chunk,)
-    offs_d = tl.arange(0, D)                     # (D,)
+    offs_n = chunk_start + tl.arange(0, Chunk)
+    offs_d = tl.arange(0, D)
     mask_n = offs_n < N
 
     Q_b = Q + pid_b * stride_qb + pid_h * stride_qh
@@ -74,111 +64,74 @@ def _kda_chunk_fwd(
     O_b = O + pid_b * stride_ob + pid_h * stride_oh
     S_b = State + pid_b * stride_sb + pid_h * stride_sh
 
-    # ── load Q, K, V, beta ──
-    Q_blk = tl.load(
-        Q_b + offs_n[:, None] * stride_qn + offs_d[None, :] * stride_qd,
-        mask=mask_n[:, None], other=0.0,
-    )  # (Chunk, D)
+    Q_blk = tl.load(Q_b + offs_n[:, None] * stride_qn + offs_d[None, :] * stride_qd,
+                     mask=mask_n[:, None], other=0.0)
+    K_blk = tl.load(K_b + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
+                     mask=mask_n[:, None], other=0.0)
+    V_blk = tl.load(V_b + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd,
+                     mask=mask_n[:, None], other=0.0)
+    beta = tl.load(Beta_b + offs_n * stride_bn, mask=mask_n, other=0.0)
 
-    K_blk = tl.load(
-        K_b + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
-        mask=mask_n[:, None], other=0.0,
-    )  # (Chunk, D)
+    # ── load state (fp32) ──
+    S = tl.load(S_b + offs_d[:, None] * stride_sd0 + offs_d[None, :] * stride_sd1)
 
-    V_blk = tl.load(
-        V_b + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd,
-        mask=mask_n[:, None], other=0.0,
-    )  # (Chunk, D)
-
-    beta = tl.load(
-        Beta_b + offs_n * stride_bn,
-        mask=mask_n, other=0.0,
-    )  # (Chunk,)
-
-    # ── load state (D, D) ──
-    S = tl.load(
-        S_b + offs_d[:, None] * stride_sd0 + offs_d[None, :] * stride_sd1,
-    )  # (D, D)
-
-    # ── 1. contribution from previous state: O_inter = Q @ S ──
-    O_inter = tl.dot(Q_blk * scale, S)  # (Chunk, D) fp32
+    # ── 1. cross-chunk: O_inter = Q @ S ──
+    # S is fp32 → cast Q to fp32
+    O_inter = tl.dot((Q_blk * scale).to(tl.float32), S)  # (Chunk, D) fp32
 
     # ── 2. intra-chunk causal linear attention ──
-    # For token i: sum_{j<=i} beta_j * (Q_i · K_j) * V_j
     attn = tl.dot(Q_blk * scale, tl.trans(K_blk))  # (Chunk, Chunk) fp32
     attn = tl.where(
         tl.arange(0, Chunk)[:, None] >= tl.arange(0, Chunk)[None, :],
         attn, 0.0,
     )
-    attn = attn * beta[None, :]  # scale by key's gate
-
+    attn = attn * beta[None, :]
     O_intra = tl.dot(attn.to(V_blk.dtype), V_blk)  # (Chunk, D) fp32
 
-    # ── 3. total output ──
+    # ── 3. store output ──
     O_final = (O_inter + O_intra).to(O_b.dtype.element_ty)
+    tl.store(O_b + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od,
+             O_final, mask=mask_n[:, None])
 
-    tl.store(
-        O_b + offs_n[:, None] * stride_on + offs_d[None, :] * stride_od,
-        O_final,
-        mask=mask_n[:, None],
-    )
-
-    # ── 4. update state: S += sum_t beta_t * K_t ⊗ V_t ──
-    # State must store K⊗V (NOT V⊗K) so that Q@S gives (Q·K)V,
-    # matching the intra-chunk attention computation.
+    # ── 4. update state: S += K^T @ diag(beta) @ V ──
+    # State stores K⊗V: S[d,e] = Σ β_t K_t[d] V_t[e]
     KS = tl.dot(
         tl.trans(K_blk * beta[:, None]).to(V_blk.dtype),
         V_blk,
-    )  # (D, D) — S[d,e] = sum_t beta_t * K_t[d] * V_t[e]
-    S_new = S + KS.to(S.dtype)
+    )  # (D, D) fp32 from fp16×fp16 dot
+    S_new = S + KS  # fp32 + fp32
 
-    tl.store(
-        S_b + offs_d[:, None] * stride_sd0 + offs_d[None, :] * stride_sd1,
-        S_new,
-    )
+    tl.store(S_b + offs_d[:, None] * stride_sd0 + offs_d[None, :] * stride_sd1,
+             S_new)
 
 
 def kda_attention(q, k, v, beta=None, chunk_size=64):
     """
     Kimi Delta Attention (chunked forward pass).
-
-    Chunks are processed SEQUENTIALLY — state from chunk i feeds chunk i+1.
-    Each chunk launch parallelizes across (batch, head) only.
-
-    Args:
-        q:    (B, H, N, D)
-        k:    (B, H, N, D)
-        v:    (B, H, N, D)
-        beta: (B, H, N) gating values. If None, defaults to 1.0.
-        chunk_size: tokens per chunk.
-
-    Returns:
-        o: (B, H, N, D)
+    Chunks processed sequentially; state carried between launches.
     """
     B, H, N, D = q.shape
-    assert D in (16, 32, 64, 128), f"head_dim must be power-of-2 ≤128, got {D}"
+    assert D in (16, 32, 64, 128)
 
     if beta is None:
         beta = torch.ones(B, H, N, dtype=torch.float32, device=q.device)
 
     o = torch.empty_like(q)
-    state = torch.zeros(B, H, D, D, dtype=q.dtype, device=q.device)
+    state = torch.zeros(B, H, D, D, dtype=torch.float32, device=q.device)  # fp32 for stability
     scale = 1.0 / (D ** 0.5)
 
     n_chunks = triton.cdiv(N, chunk_size)
     for c in range(n_chunks):
         chunk_start = c * chunk_size
         _kda_chunk_fwd[(B, H)](
-            q, k, v, beta, o,
-            state,
+            q, k, v, beta, o, state,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             beta.stride(0), beta.stride(1), beta.stride(2),
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
             state.stride(0), state.stride(1), state.stride(2), state.stride(3),
-            chunk_start,
-            N,
+            chunk_start, N,
             scale=scale, Chunk=chunk_size, D=D,
             num_warps=4 if D <= 64 else 8,
             num_stages=2,
@@ -191,7 +144,7 @@ def kda_attention(q, k, v, beta=None, chunk_size=64):
 def kda_attention_ref(q, k, v, beta=None):
     """
     PyTorch reference: sequential (non-chunked) KDA forward.
-    O(N×D²), but mathematically exact for verification.
+    Computes in fp32 for maximum precision.
     """
     B, H, N, D = q.shape
     if beta is None:
@@ -215,10 +168,10 @@ def kda_attention_ref(q, k, v, beta=None):
         # output = Q_t @ S + beta_t * (Q_t · K_t) * V_t
         o_t = torch.einsum('bhd,bhde->bhe', q_t, S)
         o_t = o_t + b_t[:, :, None] * (q_t * k_t).sum(-1, keepdim=True) * v_t
-
         o[:, :, t, :] = o_t.to(q.dtype)
 
-        # state update: S += beta_t * K_t ⊗ V_t  (K⊗V, not V⊗K)
+        # state update: S += beta_t * K_t ⊗ V_t
+        # S[d,e] += beta_t * K_t[d] * V_t[e]
         S = S + b_t[:, :, None, None] * torch.einsum('bhd,bhe->bhde', k_t, v_t)
 
     return o
