@@ -90,12 +90,13 @@ def _mla_attn_fwd(
             mask=kj[:, None] < N, other=0.0,
         )  # (Bc, d_compress) fp16
 
-        # ── up-project K and V on-the-fly (fp16 × fp16 → fp32, cast back to fp16) ──
-        K_blk = tl.dot(c_kv, W_UK_blk).to(tl.float16)  # (Bc, D) fp16
-        V_blk = tl.dot(c_kv, W_UV_blk).to(tl.float16)  # (Bc, D) fp16
+        # ── up-project K and V on-the-fly, keep in fp32 for precision ──
+        # fp16 double-matmul (up-project then attention) loses too much precision
+        K_blk = tl.dot(c_kv, W_UK_blk)    # (Bc, D) fp32 accumulator
+        V_blk = tl.dot(c_kv, W_UV_blk)    # (Bc, D) fp32 accumulator
 
-        # ── attention scores (fp16 × fp16 → fp32) ──
-        S = tl.dot(Q_blk, tl.trans(K_blk)) * scale  # (Br, Bc) fp32
+        # ── attention scores in fp32 ──
+        S = tl.dot(Q_blk.to(tl.float32), tl.trans(K_blk)) * scale  # (Br, Bc) fp32
 
         # ── online softmax (fp32) ──
         m_block = tl.max(S, axis=1)
@@ -106,7 +107,7 @@ def _mla_attn_fwd(
         l_i = l_i * alpha
         O_acc = O_acc * alpha[:, None]
         l_i = l_i + tl.sum(p, axis=1)
-        O_acc = O_acc + tl.dot(p.to(tl.float16), V_blk)  # cast p to fp16 for dot
+        O_acc = O_acc + tl.dot(p.to(tl.float32), V_blk)  # fp32 × fp32 → fp32
 
         m_i = m_new
 
