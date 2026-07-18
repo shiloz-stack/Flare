@@ -196,8 +196,6 @@ def mla_attention_ref(q, c_kv, W_UK, W_UV):
 
     # up-project K and V
     # c_kv: (B, N, d_compress) → K: (B, H, N, D_qk)
-    K = torch.einsum('bnd,dhd->bhn', c_kv, W_UK).unsqueeze(2).expand(-1, -1, N, -1)
-    # Actually need per-position K: (B, N, H, D) then transpose
     K = torch.einsum('bnd,dhk->bnhk', c_kv, W_UK).transpose(1, 2)  # (B, H, N, D_qk)
     V = torch.einsum('bnd,dhv->bnhv', c_kv, W_UV).transpose(1, 2)  # (B, H, N, D_v)
 
