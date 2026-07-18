@@ -96,22 +96,23 @@ def _mla_attn_fwd(
         )  # (Bc, d_compress)
 
         # ── up-project to K and V on-the-fly (stays in SRAM) ──
+        # Keep in fp32 — double matmul in fp16 loses too much precision
         # K = c_kv @ W_UK_h  →  (Bc, D_qk)
         W_UK_blk = tl.load(
             UK_h + tl.arange(0, d_compress)[:, None] * stride_uk_d
                    + tl.arange(0, D_qk)[None, :] * stride_uk_k,
         )  # (d_compress, D_qk)
-        K_blk = tl.dot(c_kv, W_UK_blk).to(Q_blk.dtype)  # (Bc, D_qk) — tl.dot returns fp32, cast back
+        K_blk = tl.dot(c_kv, W_UK_blk)  # (Bc, D_qk) — fp32 from accumulator, keep fp32
 
         # V = c_kv @ W_UV_h  →  (Bc, D_v)
         W_UV_blk = tl.load(
             UV_h + tl.arange(0, d_compress)[:, None] * stride_uv_d
                    + tl.arange(0, D_v)[None, :] * stride_uv_v,
         )  # (d_compress, D_v)
-        V_blk = tl.dot(c_kv, W_UV_blk).to(Q_blk.dtype)  # (Bc, D_v)
+        V_blk = tl.dot(c_kv, W_UV_blk)  # (Bc, D_v) — fp32, keep fp32
 
-        # ── standard attention score ──
-        S = tl.dot(Q_blk, tl.trans(K_blk)) * scale  # (Br, Bc)
+        # ── standard attention score (fp32 throughout) ──
+        S = tl.dot(Q_blk.to(tl.float32), tl.trans(K_blk)) * scale  # (Br, Bc)
 
         # ── online softmax ──
         m_block = tl.max(S, axis=1)
@@ -122,7 +123,7 @@ def _mla_attn_fwd(
         c_i = c_i * alpha
         O_acc = O_acc * alpha[:, None]
         c_i = c_i + tl.sum(p, axis=1)
-        O_acc = O_acc + tl.dot(p.to(V_blk.dtype), V_blk)
+        O_acc = O_acc + tl.dot(p, V_blk)  # p is fp32, V_blk is fp32
         m_i = m_new
 
     O_acc = O_acc / c_i[:, None]
