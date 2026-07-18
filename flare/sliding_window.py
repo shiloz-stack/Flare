@@ -12,14 +12,12 @@ Paper: Jiang et al., "Mistral 7B", 2023.  https://arxiv.org/abs/2310.06825
 
 The implementation reuses the FA v2 kernel with a different mask:
   causal:  q_idx >= k_idx
-  sliding: q_idx - W < k_idx <= q_idx
+  sliding: q_idx >= k_idx AND q_idx - k_idx < WINDOW
 """
 
 import torch
 import triton
 import triton.language as tl
-
-from .flash_attn_v2 import flash_attn_v2
 
 
 @triton.jit
@@ -49,10 +47,10 @@ def _sliding_window_attn_fwd(
     Lse_b = Lse + pid_b * stride_lse_b + pid_h * stride_lse_h
 
     q_idx = pid_q * Br + tl.arange(0, Br)
-    k_idx_base = tl.arange(0, Bc)
+    offs_d = tl.arange(0, D)
 
     Q_blk = tl.load(
-        Q_b + q_idx[:, None] * stride_qn + tl.arange(0, D)[None, :] * stride_qd,
+        Q_b + q_idx[:, None] * stride_qn + offs_d[None, :] * stride_qd,
         mask=q_idx[:, None] < N, other=0.0,
     )
 
@@ -60,33 +58,31 @@ def _sliding_window_attn_fwd(
     l_i = tl.full([Br], 0.0, dtype=tl.float32)
     O_acc = tl.zeros([Br, D], dtype=tl.float32)
 
-    # ── sliding window: only iterate over K/V blocks within [q_idx - WINDOW, q_idx] ──
-    # The first relevant K/V block for this Q block:
-    q_min_idx = pid_q * Br
-    j_start = max(0, (q_min_idx - WINDOW) // Bc)
-    q_max_idx = pid_q * Br + Br - 1
-    j_end = tl.cdiv(q_max_idx + 1, Bc)
-
-    for j in range(j_start, j_end):
-        kj = j * Bc + k_idx_base
+    # Iterate over ALL K/V blocks — skip invalid ones via mask.
+    # This avoids Triton JIT issues with data-dependent loop bounds.
+    n_kv_blocks = tl.cdiv(N, Bc)
+    for j in range(0, n_kv_blocks):
+        kj = j * Bc + tl.arange(0, Bc)
 
         K_blk = tl.load(
-            K_b + kj[:, None] * stride_kn + tl.arange(0, D)[None, :] * stride_kd,
+            K_b + kj[:, None] * stride_kn + offs_d[None, :] * stride_kd,
             mask=kj[:, None] < N, other=0.0,
         )
         V_blk = tl.load(
-            V_b + kj[:, None] * stride_vn + tl.arange(0, D)[None, :] * stride_vd,
+            V_b + kj[:, None] * stride_vn + offs_d[None, :] * stride_vd,
             mask=kj[:, None] < N, other=0.0,
         )
 
         S = tl.dot(Q_blk, tl.trans(K_blk)) * scale
 
         # ── sliding window + causal mask ──
-        # valid: q_idx - WINDOW < k_idx <= q_idx
+        # valid: q_idx >= kj AND q_idx - kj < WINDOW AND kj < N
         mask = (q_idx[:, None] >= kj[None, :]) & \
-               (q_idx[:, None] - kj[None, :] < WINDOW)
+               (q_idx[:, None] - kj[None, :] < WINDOW) & \
+               (kj[None, :] < N)
         S = tl.where(mask, S, float('-inf'))
 
+        # ── online softmax ──
         m_block = tl.max(S, axis=1)
         m_new = tl.maximum(m_i, m_block)
         alpha = tl.exp(m_i - m_new)
@@ -98,14 +94,16 @@ def _sliding_window_attn_fwd(
         O_acc = O_acc + tl.dot(p.to(V_blk.dtype), V_blk)
         m_i = m_new
 
-    O_acc = O_acc / l_i[:, None]
+    # ── guard against division by zero (shouldn't happen with valid input) ──
+    l_i_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    O_acc = O_acc / l_i_safe[:, None]
 
     tl.store(
-        O_b + q_idx[:, None] * stride_on + tl.arange(0, D)[None, :] * stride_od,
+        O_b + q_idx[:, None] * stride_on + offs_d[None, :] * stride_od,
         O_acc,
         mask=q_idx[:, None] < N,
     )
-    lse = tl.log(l_i)
+    lse = tl.log(l_i_safe)
     tl.store(Lse_b + q_idx * stride_lse_n, lse, mask=q_idx < N)
 
 
