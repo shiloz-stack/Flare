@@ -92,8 +92,9 @@ def _mla_attn_fwd(
 
         # ── up-project K and V on-the-fly, keep in fp32 for precision ──
         # fp16 double-matmul (up-project then attention) loses too much precision
-        K_blk = tl.dot(c_kv, W_UK_blk)    # (Bc, D) fp32 accumulator
-        V_blk = tl.dot(c_kv, W_UV_blk)    # (Bc, D) fp32 accumulator
+        c_kv_f32 = c_kv.to(tl.float32)
+        K_blk = tl.dot(c_kv_f32, W_UK_blk.to(tl.float32))    # (Bc, D) fp32
+        V_blk = tl.dot(c_kv_f32, W_UV_blk.to(tl.float32))    # (Bc, D) fp32
 
         # ── attention scores in fp32 ──
         S = tl.dot(Q_blk.to(tl.float32), tl.trans(K_blk)) * scale  # (Br, Bc) fp32
@@ -107,7 +108,7 @@ def _mla_attn_fwd(
         l_i = l_i * alpha
         O_acc = O_acc * alpha[:, None]
         l_i = l_i + tl.sum(p, axis=1)
-        O_acc = O_acc + tl.dot(p.to(tl.float32), V_blk)  # fp32 × fp32 → fp32
+        O_acc = O_acc + tl.dot(p, V_blk)  # fp32 × fp32 → fp32
 
         m_i = m_new
 
@@ -167,20 +168,13 @@ def mla_attention(
 def mla_attention_ref(q, c_kv, W_UK, W_UV):
     """PyTorch reference — computes in fp32 for maximum precision."""
     B, H, N, D = q.shape
-    d_compress = c_kv.shape[-1]
 
-    # Compute in fp32 to serve as ground truth
-    q_f32 = q.float()
-    c_kv_f32 = c_kv.float()
-    W_UK_f32 = W_UK.float()
-    W_UV_f32 = W_UV.float()
-
-    # up-project K and V
-    K = torch.einsum('bnd,dhk->bnhk', c_kv_f32, W_UK_f32).transpose(1, 2)  # (B, H, N, D)
-    V = torch.einsum('bnd,dhv->bnhv', c_kv_f32, W_UV_f32).transpose(1, 2)  # (B, H, N, D)
+    # up-project K and V in fp32
+    K = torch.einsum('bnd,dhk->bnhk', c_kv.float(), W_UK.float()).transpose(1, 2)  # (B, H, N, D)
+    V = torch.einsum('bnd,dhv->bnhv', c_kv.float(), W_UV.float()).transpose(1, 2)  # (B, H, N, D)
 
     scale = 1.0 / (D ** 0.5)
-    S = torch.einsum('bhnd,bhmd->bhnm', q_f32 * scale, K)  # (B, H, N, N)
+    S = torch.einsum('bhnd,bhmd->bhnm', q.float() * scale, K)  # (B, H, N, N)
     S_max = S.amax(dim=-1, keepdim=True)
     P = torch.exp(S - S_max)
     P = P / P.sum(dim=-1, keepdim=True)
