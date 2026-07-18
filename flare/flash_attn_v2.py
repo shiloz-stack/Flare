@@ -68,7 +68,7 @@ def _flash_attn_fwd(
     )  # (Br, D)
 
     # ── initialize accumulators ──
-    m_i = tl.full([Br], float('-inf'), dtype=tl.float32)  # running max
+    m_i = tl.full([Br], -1e4, dtype=tl.float32)  # running max
     l_i = tl.full([Br], 0.0, dtype=tl.float32)            # running sum
     O_acc = tl.zeros([Br, D], dtype=tl.float32)            # output accumulator
 
@@ -99,7 +99,7 @@ def _flash_attn_fwd(
         # apply causal mask
         if CAUSAL:
             mask = q_idx[:, None] >= kj[None, :]  # (Br, Bc)
-            S = tl.where(mask, S, float('-inf'))
+            S = tl.where(mask, S, -1e4)
 
         # ── online softmax ──
         m_block = tl.max(S, axis=1)                  # (Br,)

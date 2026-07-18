@@ -76,7 +76,7 @@ def _mla_attn_fwd(
     UV_h = W_UV + pid_h * stride_uv_h
 
     # ── accumulators ──
-    m_i = tl.full([Br], float('-inf'), dtype=tl.float32)
+    m_i = tl.full([Br], -1e4, dtype=tl.float32)
     c_i = tl.zeros([Br], dtype=tl.float32)
     O_acc = tl.zeros([Br, D_v], dtype=tl.float32)
 

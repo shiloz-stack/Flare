@@ -54,7 +54,7 @@ def _sliding_window_attn_fwd(
         mask=q_idx[:, None] < N, other=0.0,
     )
 
-    m_i = tl.full([Br], float('-inf'), dtype=tl.float32)
+    m_i = tl.full([Br], -1e4, dtype=tl.float32)
     l_i = tl.full([Br], 0.0, dtype=tl.float32)
     O_acc = tl.zeros([Br, D], dtype=tl.float32)
 
@@ -76,17 +76,17 @@ def _sliding_window_attn_fwd(
         S = tl.dot(Q_blk, tl.trans(K_blk)) * scale
 
         # ── sliding window + causal mask ──
-        # valid: q_idx >= kj AND q_idx - kj < WINDOW AND kj < N
         mask = (q_idx[:, None] >= kj[None, :]) & \
                (q_idx[:, None] - kj[None, :] < WINDOW) & \
                (kj[None, :] < N)
-        S = tl.where(mask, S, float('-inf'))
+        S = tl.where(mask, S, -1e4)
 
         # ── online softmax ──
         m_block = tl.max(S, axis=1)
         m_new = tl.maximum(m_i, m_block)
         alpha = tl.exp(m_i - m_new)
-        p = tl.exp(S - m_new[:, None])
+        # zero out masked entries in p so they don't contribute to O_acc
+        p = tl.where(mask, tl.exp(S - m_new[:, None]), 0.0)
 
         l_i = l_i * alpha
         O_acc = O_acc * alpha[:, None]
@@ -94,7 +94,7 @@ def _sliding_window_attn_fwd(
         O_acc = O_acc + tl.dot(p.to(V_blk.dtype), V_blk)
         m_i = m_new
 
-    # ── guard against division by zero (shouldn't happen with valid input) ──
+    # ── guard against division by zero ──
     l_i_safe = tl.where(l_i == 0.0, 1.0, l_i)
     O_acc = O_acc / l_i_safe[:, None]
 
