@@ -164,18 +164,24 @@ def mla_attention(
 # ─── PyTorch reference for testing ───────────────────────────────────────────
 
 def mla_attention_ref(q, c_kv, W_UK, W_UV):
-    """PyTorch eager-mode reference for correctness checking."""
+    """PyTorch reference — computes in fp32 for maximum precision."""
     B, H, N, D = q.shape
     d_compress = c_kv.shape[-1]
 
+    # Compute in fp32 to serve as ground truth
+    q_f32 = q.float()
+    c_kv_f32 = c_kv.float()
+    W_UK_f32 = W_UK.float()
+    W_UV_f32 = W_UV.float()
+
     # up-project K and V
-    K = torch.einsum('bnd,dhk->bnhk', c_kv, W_UK).transpose(1, 2)  # (B, H, N, D)
-    V = torch.einsum('bnd,dhv->bnhv', c_kv, W_UV).transpose(1, 2)  # (B, H, N, D)
+    K = torch.einsum('bnd,dhk->bnhk', c_kv_f32, W_UK_f32).transpose(1, 2)  # (B, H, N, D)
+    V = torch.einsum('bnd,dhv->bnhv', c_kv_f32, W_UV_f32).transpose(1, 2)  # (B, H, N, D)
 
     scale = 1.0 / (D ** 0.5)
-    S = torch.einsum('bhnd,bhmd->bhnm', q * scale, K)  # (B, H, N, N)
+    S = torch.einsum('bhnd,bhmd->bhnm', q_f32 * scale, K)  # (B, H, N, N)
     S_max = S.amax(dim=-1, keepdim=True)
     P = torch.exp(S - S_max)
     P = P / P.sum(dim=-1, keepdim=True)
     O = torch.einsum('bhnm,bhmd->bhnd', P, V)  # (B, H, N, D)
-    return O
+    return O.to(q.dtype)
